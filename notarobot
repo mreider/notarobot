@@ -1,0 +1,141 @@
+#!/bin/bash
+
+# Check for command-line argument
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 [gcp|aws|azure]"
+    exit 1
+fi
+
+CLOUD_PROVIDER=$1
+
+# Set common variables
+NAMESPACE="otel-demo"
+SERVICE_NAME="otel-demo-frontendproxy" 
+DYNATRACE_ENDPOINT="${DYNATRACE_ENDPOINT}"
+DYNATRACE_API_TOKEN="${DYNATRACE_API_TOKEN}"
+TEMPLATE_VALUES_FILE="values-template.yaml"
+FINAL_VALUES_FILE="values.yaml"
+
+
+# Function to detect OS and use appropriate sed syntax
+replace_placeholder() {
+    local file=$1
+    local placeholder=$2
+    local replacement=$3
+
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS
+        sed -i '' "s|$placeholder|$replacement|g" "$file"
+    else
+        # Linux
+        sed -i "s|$placeholder|$replacement|g" "$file"
+    fi
+}
+
+# Replace placeholders in the template values file
+cp "$TEMPLATE_VALUES_FILE" "$FINAL_VALUES_FILE"
+replace_placeholder "$FINAL_VALUES_FILE" "DYNATRACE_ENDPOINT_PLACEHOLDER" "$DYNATRACE_ENDPOINT"
+replace_placeholder "$FINAL_VALUES_FILE" "DYNATRACE_API_TOKEN_PLACEHOLDER" "$DYNATRACE_API_TOKEN"
+
+# Function for GCP deployment
+deploy_gcp() {
+    PROJECT_ID="${GCP_PROJECT_ID}"
+    GKE_CLUSTER_NAME="${GKE_CLUSTER_NAME}"
+    GKE_CLUSTER_ZONE="${GKE_CLUSTER_ZONE}"
+
+    if [ -z "$PROJECT_ID" ] || [ -z "$GKE_CLUSTER_NAME" ] || [ -z "$GKE_CLUSTER_ZONE" ]; then
+        echo "Error: Set GCP_PROJECT_ID, GKE_CLUSTER_NAME, and GKE_CLUSTER_ZONE environment variables."
+        exit 1
+    fi
+
+    gcloud config set project $PROJECT_ID
+    gcloud services enable container.googleapis.com
+    gcloud container clusters get-credentials $GKE_CLUSTER_NAME --zone $GKE_CLUSTER_ZONE
+}
+
+# Function for AWS deployment
+deploy_aws() {
+    EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME}"
+
+    if [ -z "$EKS_CLUSTER_NAME" ]; then
+        echo "Error: Set EKS_CLUSTER_NAME environment variable."
+        exit 1
+    fi
+
+    aws eks update-kubeconfig --name $EKS_CLUSTER_NAME
+}
+
+# Function for Azure deployment
+deploy_azure() {
+    AKS_CLUSTER_NAME="${AKS_CLUSTER_NAME}"
+    AKS_RESOURCE_GROUP="${AKS_RESOURCE_GROUP}"
+
+    if [ -z "$AKS_CLUSTER_NAME" ] || [ -z "$AKS_RESOURCE_GROUP" ]; then
+        echo "Error: Set AKS_CLUSTER_NAME and AKS_RESOURCE_GROUP environment variables."
+        exit 1
+    fi
+
+    az aks get-credentials --name $AKS_CLUSTER_NAME --resource-group $AKS_RESOURCE_GROUP
+}
+
+# Function to deploy OTel demo and patch with nip.io
+deploy_and_patch_otel_demo() {
+    # Create namespace if it doesn't exist
+    if ! kubectl get namespace $NAMESPACE > /dev/null 2>&1; then
+        kubectl create namespace $NAMESPACE
+        echo "Created namespace: $NAMESPACE"
+    else
+        echo "Namespace $NAMESPACE already exists"
+    fi
+
+    # Add OpenTelemetry Helm repository
+    helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+    helm repo update
+
+    # Install or update OTel demo using Helm
+    helm upgrade --install otel-demo open-telemetry/opentelemetry-demo -f "$VALUES_FILE" -n $NAMESPACE
+
+    # Wait for the external IP address of the service
+    echo "Waiting for external IP address of the $SERVICE_NAME service..."
+    while true; do
+        IP=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        if [ ! -z "$IP" ]; then
+            echo "$SERVICE_NAME service has been assigned IP: $IP"
+            break
+        fi
+        sleep 10
+    done
+
+    # Patch deployment with nip.io hostname
+    NIP_HOST="${IP}.nip.io"
+    kubectl set env deployment/otel-demo-frontendproxy PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://$NIP_HOST/otlp-http/v1/traces -n $NAMESPACE
+    echo "Deployment otel-demo-frontendproxy patched with PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://$NIP_HOST/otlp-http/v1/traces"
+
+    # Construct and print the URLs with nip.io
+    echo "OpenTelemetry Demo Application URLs:"
+    echo "Webstore:             http://$NIP_HOST:8080/"
+    echo "Grafana:              http://$NIP_HOST:8080/grafana/"
+    echo "Feature Flags UI:     http://$NIP_HOST:8080/feature/"
+    echo "Load Generator UI:    http://$NIP_HOST:8080/loadgen/"
+    echo "Jaeger UI:            http://$NIP_HOST:8080/jaeger/ui/"
+}
+
+# Main switch case to handle different cloud providers
+case $CLOUD_PROVIDER in
+    gcp)
+        deploy_gcp
+        ;;
+    aws)
+        deploy_aws
+        ;;
+    azure)
+        deploy_azure
+        ;;
+    *)
+        echo "Unsupported cloud provider: $CLOUD_PROVIDER"
+        exit 1
+        ;;
+esac
+
+# Execute deployment and patching
+deploy_and_patch_otel_demo

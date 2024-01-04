@@ -1,0 +1,96 @@
+opentelemetry-collector:
+  ports:
+    prometheus:
+      enabled: false
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+          http:
+            # Since this collector needs to receive data from the web, enable cors for all origins
+            # `allowed_origins` can be refined for your deployment domain
+            cors:
+              allowed_origins:
+                - "http://*"
+                - "https://*"
+
+    exporters:
+      # otlp/http exporter to export traces to Dynatrace.
+      otlphttp/dynatrace:
+        sending_queue:
+          enabled: false
+        endpoint:  "DYNATRACE_ENDPOINT_PLACEHOLDER"
+        headers:
+          Authorization: "Api-Token DYNATRACE_API_TOKEN_PLACEHOLDER"
+
+    processors:
+      cumulativetodelta:
+      filter/histograms:
+        error_mode: ignore
+        metrics:
+          metric:
+              - 'type == METRIC_DATA_TYPE_HISTOGRAM'
+              - 'IsMatch(name, "kafka.consumer.*")'
+              - 'IsMatch(unit, "{*")'
+    connectors:
+      forward:
+    service:
+      pipelines:
+        logs:
+          exporters:
+          - debug
+          - forward
+          processors:
+          - k8sattributes
+          - memory_limiter
+          - batch
+          receivers:
+          - otlp
+        metrics:
+          exporters:
+          - otlphttp/prometheus
+          - debug
+          - forward
+          processors:
+          - k8sattributes
+          - memory_limiter
+          - filter/ottl
+          - transform
+          - resource
+          - batch
+          - cumulativetodelta
+          receivers:
+          - otlp
+          - spanmetrics
+        traces:
+          exporters:
+          - otlp
+          - debug
+          - spanmetrics
+          - forward
+          processors:
+          - k8sattributes
+          - memory_limiter
+          - resource
+          - batch
+          receivers:
+          - otlp
+          - jaeger
+          - zipkin
+        traces/dynatrace:
+          receivers: [forward] 
+          processors: []
+          exporters: [otlphttp/dynatrace, otlp, logging, spanmetrics]
+        metrics/dynatrace:
+          receivers: [forward]
+          processors: []
+          exporters: [otlphttp/dynatrace, logging]
+        logs/dynatrace:
+          receivers: [forward]
+          processors: [] 
+          exporters: [otlphttp/dynatrace]
+components:
+  frontendProxy:
+    service:
+      type: LoadBalancer
